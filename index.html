@@ -26,4 +26,508 @@
     const FIREBASE_CONFIG = {
       apiKey:            "AIzaSyCZXnVYTbHVNqdBLeiVxrhW70uBWfU4rEo",
       authDomain:        "equipopadel-2a136.firebaseapp.com",
-      databaseURL:       "https://equipopadel-2a136
+      databaseURL:       "https://equipopadel-2a136-default-rtdb.europe-west1.firebasedatabase.app",
+      projectId:         "equipopadel-2a136",
+      storageBucket:     "equipopadel-2a136.firebasestorage.app",
+      messagingSenderId: "527651468308",
+      appId:             "1:527651468308:web:abe8654a5348d30776a301"
+    };
+
+    const FB_CONFIGURED = FIREBASE_CONFIG.projectId !== "";
+    let db = null;
+    if (FB_CONFIGURED) { firebase.initializeApp(FIREBASE_CONFIG); db = firebase.firestore(); }
+
+    function subscribeFirestore(onData) {
+      if (!db) return;
+      const unsubs = [];
+      let received = { players: false, matches: false, config: false };
+      let state = { players: null, matches: null, password: null };
+      const emit = () => { if (received.players && received.matches && received.config) onData({ ...state }); };
+      unsubs.push(db.collection("padel").doc("players").onSnapshot(snap => { received.players = true; state.players = snap.exists ? snap.data().list : []; emit(); }));
+      unsubs.push(db.collection("padel").doc("matches").onSnapshot(snap => { received.matches = true; state.matches = snap.exists ? snap.data().list : []; emit(); }));
+      unsubs.push(db.collection("padel").doc("config").onSnapshot(snap => { received.config = true; state.password = snap.exists ? snap.data().password : null; emit(); }));
+      return () => unsubs.forEach(u => u());
+    }
+
+    async function savePlayers(p) { if (!db) { _lsSet("players",p); return; } await db.collection("padel").doc("players").set({ list: p }); }
+    async function saveMatches(m) { if (!db) { _lsSet("matches",m); return; } await db.collection("padel").doc("matches").set({ list: m }); }
+    async function savePassword(pw) { if (!db) { _lsSet("password",pw); return; } await db.collection("padel").doc("config").set({ password: pw }); }
+    async function initFirestore(players, matches, password) {
+      if (!db) return;
+      const batch = db.batch();
+      const ref = (id) => db.collection("padel").doc(id);
+      batch.set(ref("players"), { list: players });
+      batch.set(ref("matches"), { list: matches });
+      batch.set(ref("config"), { password });
+      await batch.commit();
+    }
+    function _lsSet(k, v) { try { localStorage.setItem("padel-"+k, JSON.stringify(v)); } catch {} }
+    function _lsGet(k, def) { try { return JSON.parse(localStorage.getItem("padel-"+k)) || def; } catch { return def; } }
+
+    const TEAM_POSITIONS = [1,2,3,4,5];
+    const DEFAULT_PASSWORD = "padel2024";
+    const DEFAULT_PLAYERS = Array.from({ length: 25 }, (_, i) => ({ id: i+1, name: `Jugador ${i+1}`, historicPoints: 0 }));
+    const emptyTeam = (pos) => ({ position: pos, players: ["",""], sides: ["izq","der"], numSets: 2, won: false });
+
+    function computeStats(players, matches) {
+      const stats = {};
+      players.forEach(p => { stats[p.id] = { totalWins:0, totalMatches:0, byPosition:{1:{w:0,m:0},2:{w:0,m:0},3:{w:0,m:0},4:{w:0,m:0},5:{w:0,m:0}}, bySide:{izq:{w:0,m:0},der:{w:0,m:0}}, partners:{} }; });
+      matches.forEach(match => {
+        match.teams.forEach(team => {
+          const [a,b] = team.players; const won = team.won; const pos = team.position;
+          [a,b].forEach(pid => { if (!stats[pid]) return; stats[pid].totalMatches++; if (won) stats[pid].totalWins++; stats[pid].byPosition[pos].m++; if (won) stats[pid].byPosition[pos].w++; });
+          if (a&&b) { if (!stats[a].partners[b]) stats[a].partners[b]={w:0,m:0}; if (!stats[b].partners[a]) stats[b].partners[a]={w:0,m:0}; stats[a].partners[b].m++; stats[b].partners[a].m++; if (won){stats[a].partners[b].w++;stats[b].partners[a].w++;} }
+          const sides = team.sides||[];
+          [a,b].forEach((pid,pi) => { if (!pid||!stats[pid]) return; const side=sides[pi]; if (side==='izq'||side==='der'){stats[pid].bySide[side].m++;if(won)stats[pid].bySide[side].w++;} });
+        });
+      });
+      return stats;
+    }
+
+    function bestPartner(pid, stats, players) {
+      const partners = stats[pid]?.partners||{}; let best=null,bestRatio=-1;
+      Object.entries(partners).forEach(([id,s]) => { if (!s.m) return; const r=s.w/s.m; if (r>bestRatio){bestRatio=r;best=parseInt(id);} });
+      if (!best) return null;
+      return { player: players.find(x=>x.id===best), ratio:bestRatio, wins:partners[best].w, matches:partners[best].m };
+    }
+
+    function getRollingWindow() {
+      const now = new Date();
+      const startOfThisMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+      return { windowStart: new Date(now.getFullYear()-1, now.getMonth(), 1), windowEnd: new Date(startOfThisMonth.getTime()-1) };
+    }
+
+    function totalPoints(player, matches) {
+      const { windowStart, windowEnd } = getRollingWindow();
+      let pts = player.historicPoints||0;
+      matches.forEach(m => { const d=new Date(m.date); if (d>=windowStart&&d<=windowEnd) m.teams.forEach(t => { if (t.players.includes(player.id)&&t.won) pts+=30; }); });
+      return pts;
+    }
+
+    function pointsInMonth(player, matches, year, month) {
+      let pts=0; const ms=`${year}-${String(month+1).padStart(2,"0")}`;
+      matches.forEach(m => { if (m.date&&m.date.startsWith(ms)) m.teams.forEach(t => { if (t.players.includes(player.id)&&t.won) pts+=30; }); });
+      return pts;
+    }
+
+    function proposeTeams(players, matches, stats) {
+      const ranked=[...players].sort((a,b)=>totalPoints(b,matches)-totalPoints(a,matches));
+      const used=new Set(); const teams=[];
+      for (let pos=1;pos<=5;pos++) {
+        const avail=ranked.filter(p=>!used.has(p.id)); if (avail.length<2) break;
+        const p1=avail[0]; const bp=bestPartner(p1.id,stats,players);
+        const p2=(bp&&bp.player&&!used.has(bp.player.id))?bp.player:avail[1];
+        used.add(p1.id); used.add(p2.id); teams.push({position:pos,players:[p1,p2]});
+      }
+      return teams;
+    }
+
+    function ConfirmModal({ message, onConfirm, onCancel }) {
+      return (
+        <div className="modal-overlay" onClick={onCancel}>
+          <div className="modal" onClick={e=>e.stopPropagation()} style={{maxWidth:340}}>
+            <div style={{fontSize:14,color:"#f0f4ff",marginBottom:20,lineHeight:1.6,whiteSpace:"pre-line"}}>{message}</div>
+            <div style={{display:"flex",gap:10}}>
+              <button className="btn-danger" onClick={onConfirm} style={{flex:1,padding:"9px"}}>Confirmar</button>
+              <button className="btn-outline" onClick={onCancel} style={{flex:1}}>Cancelar</button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [tab,setTab]=useState("resultados");
+      const [players,setPlayers]=useState(null);
+      const [matches,setMatches]=useState(null);
+      const [adminPassword,setAdminPassword]=useState(null);
+      const [isAdmin,setIsAdmin]=useState(false);
+      const [loading,setLoading]=useState(true);
+      const [adminModal,setAdminModal]=useState(false);
+      const [adminPwd,setAdminPwd]=useState("");
+      const [adminError,setAdminError]=useState("");
+
+      useEffect(() => {
+        if (FB_CONFIGURED) {
+          let initialized=false;
+          const unsub=subscribeFirestore(async (data) => {
+            const pl=data.players&&data.players.length>0?data.players:DEFAULT_PLAYERS;
+            if (!initialized) { initialized=true; if (!data.players||data.players.length===0) await initFirestore(DEFAULT_PLAYERS,[],DEFAULT_PASSWORD); }
+            setPlayers(pl); setMatches(data.matches||[]); setAdminPassword(data.password||DEFAULT_PASSWORD); setLoading(false);
+          });
+          return unsub;
+        } else {
+          setPlayers(_lsGet("players",DEFAULT_PLAYERS)); setMatches(_lsGet("matches",[])); setAdminPassword(_lsGet("password",DEFAULT_PASSWORD)); setLoading(false);
+        }
+      }, []);
+
+      const updatePlayers=useCallback((p)=>{setPlayers(p);savePlayers(p);},[]);
+      const updateMatches=useCallback((m)=>{setMatches(m);saveMatches(m);},[]);
+      const updatePassword=useCallback((pw)=>{setAdminPassword(pw);savePassword(pw);},[]);
+      const tryAdmin=()=>{ if(adminPwd===adminPassword){setIsAdmin(true);setAdminModal(false);setAdminPwd("");setAdminError("");}else setAdminError("Contraseña incorrecta"); };
+
+      if (loading||!players||!matches) return <div style={{display:"flex",alignItems:"center",justifyContent:"center",height:"100vh",background:"#0a0f1e",color:"#e2ff5d",fontFamily:"monospace",fontSize:22}}>Cargando...</div>;
+
+      const stats=computeStats(players,matches);
+      return (
+        <div style={{minHeight:"100vh",background:"#0a0f1e",color:"#f0f4ff",fontFamily:"'DM Mono',monospace",paddingBottom:80}}>
+          <style>{`
+            @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Bebas+Neue&display=swap');
+            *{box-sizing:border-box;margin:0;padding:0;}
+            ::-webkit-scrollbar{width:4px;}::-webkit-scrollbar-thumb{background:#e2ff5d44;}
+            input,select{background:#151c35;border:1px solid #2a3560;color:#f0f4ff;padding:8px 12px;border-radius:6px;font-family:inherit;font-size:14px;outline:none;}
+            input:focus,select:focus{border-color:#e2ff5d;}
+            input[type="number"]{-moz-appearance:textfield;}
+            input[type="number"]::-webkit-inner-spin-button{-webkit-appearance:none;}
+            button{cursor:pointer;font-family:inherit;}
+            .btn{background:#e2ff5d;color:#0a0f1e;border:none;padding:8px 18px;border-radius:6px;font-weight:500;font-size:13px;transition:opacity .15s;}
+            .btn:hover{opacity:.85;}
+            .btn-outline{background:transparent;border:1px solid #e2ff5d44;color:#e2ff5d;padding:7px 16px;border-radius:6px;font-size:13px;transition:all .15s;}
+            .btn-outline:hover{background:#e2ff5d22;}
+            .btn-danger{background:#ff4d6d22;border:1px solid #ff4d6d44;color:#ff4d6d;padding:6px 14px;border-radius:6px;font-size:12px;}
+            .btn-undo{background:#ffb34722;border:1px solid #ffb34766;color:#ffb347;padding:7px 16px;border-radius:6px;font-size:13px;transition:all .15s;}
+            .btn-undo:hover{background:#ffb34733;}
+            .card{background:#111827;border:1px solid #1e2d50;border-radius:12px;padding:20px;}
+            .tag{display:inline-block;padding:2px 10px;border-radius:20px;font-size:11px;font-weight:500;}
+            .tag-win{background:#e2ff5d22;color:#e2ff5d;border:1px solid #e2ff5d44;}
+            .tag-loss{background:#ff4d6d11;color:#ff6b6b;border:1px solid #ff4d6d33;}
+            .section-title{font-family:'Bebas Neue',sans-serif;font-size:28px;color:#e2ff5d;letter-spacing:2px;margin-bottom:20px;}
+            .modal-overlay{position:fixed;inset:0;background:#000a;display:flex;align-items:center;justify-content:center;z-index:999;padding:16px;}
+            .modal{background:#111827;border:1px solid #2a3560;border-radius:16px;padding:30px;width:100%;max-width:400px;}
+            .error-banner{background:#ff4d6d22;border:1px solid #ff4d6d66;color:#ff8899;border-radius:8px;padding:10px 14px;font-size:12px;margin-bottom:12px;line-height:1.8;}
+            .set-toggle{padding:3px 12px;border-radius:4px;font-size:12px;font-family:inherit;border:none;cursor:pointer;transition:all .15s;}
+          `}</style>
+          <div style={{background:"#060b18",borderBottom:"1px solid #1e2d50",padding:"16px 20px",display:"flex",alignItems:"center",justifyContent:"space-between",position:"sticky",top:0,zIndex:100}}>
+            <div>
+              <div style={{fontFamily:"'Bebas Neue'",fontSize:26,color:"#e2ff5d",letterSpacing:3}}>PÁDEL CLUB</div>
+              <div style={{fontSize:10,color:"#4a5580",letterSpacing:2,marginTop:-2}}>GESTIÓN DE EQUIPO</div>
+            </div>
+            <div style={{display:"flex",gap:8,alignItems:"center"}}>
+              {isAdmin?(
+                <div style={{display:"flex",alignItems:"center",gap:8}}>
+                  <span style={{fontSize:11,color:"#e2ff5d",background:"#e2ff5d22",padding:"4px 10px",borderRadius:20,border:"1px solid #e2ff5d44"}}>● ADMIN</span>
+                  <button className="btn-outline" onClick={()=>setIsAdmin(false)} style={{fontSize:11,padding:"4px 12px"}}>Salir</button>
+                </div>
+              ):(
+                <button className="btn-outline" onClick={()=>setAdminModal(true)}>Admin</button>
+              )}
+            </div>
+          </div>
+          {!FB_CONFIGURED&&<div style={{padding:"12px 20px",background:"#ffb34711",borderBottom:"1px solid #ffb34733"}}><div style={{fontSize:11,color:"#ffb347",maxWidth:800,margin:"0 auto"}}>⚠ Modo local — configura Firebase para compartir con el equipo.</div></div>}
+          <div style={{display:"flex",borderBottom:"1px solid #1e2d50",background:"#060b18",padding:"0 12px",overflowX:"auto"}}>
+            {[{key:"resultados",label:"Resultados"},{key:"puntos",label:"Puntos"},{key:"estadisticas",label:"Estadísticas"},{key:"propuesta",label:"Propuesta"},...(isAdmin?[{key:"admin",label:"⚙ Admin"}]:[])].map(t=>(
+              <button key={t.key} onClick={()=>setTab(t.key)} style={{background:"none",border:"none",color:tab===t.key?"#e2ff5d":"#4a5580",padding:"14px 14px",fontSize:13,fontFamily:"inherit",borderBottom:tab===t.key?"2px solid #e2ff5d":"2px solid transparent",whiteSpace:"nowrap",transition:"color .15s"}}>{t.label}</button>
+            ))}
+          </div>
+          <div style={{padding:"20px 16px",maxWidth:800,margin:"0 auto"}}>
+            {tab==="resultados"&&<Resultados matches={matches} players={players} isAdmin={isAdmin} onUpdate={updateMatches}/>}
+            {tab==="puntos"&&<Puntos players={players} matches={matches}/>}
+            {tab==="estadisticas"&&<Estadisticas players={players} matches={matches} stats={stats}/>}
+            {tab==="propuesta"&&<Propuesta players={players} matches={matches} stats={stats}/>}
+            {tab==="admin"&&isAdmin&&<AdminPanel players={players} onUpdatePlayers={updatePlayers} matches={matches} onUpdateMatches={updateMatches} currentPassword={adminPassword} onUpdatePassword={updatePassword}/>}
+          </div>
+          {adminModal&&(
+            <div className="modal-overlay" onClick={()=>setAdminModal(false)}>
+              <div className="modal" onClick={e=>e.stopPropagation()}>
+                <div style={{fontFamily:"'Bebas Neue'",fontSize:22,color:"#e2ff5d",letterSpacing:2,marginBottom:20}}>ACCESO ADMIN</div>
+                <input type="password" placeholder="Contraseña" value={adminPwd} onChange={e=>setAdminPwd(e.target.value)} onKeyDown={e=>e.key==="Enter"&&tryAdmin()} style={{width:"100%",marginBottom:10}} autoFocus/>
+                {adminError&&<div style={{color:"#ff6b6b",fontSize:12,marginBottom:10}}>⚠ {adminError}</div>}
+                <div style={{display:"flex",gap:10}}>
+                  <button className="btn" onClick={tryAdmin} style={{flex:1}}>Entrar</button>
+                  <button className="btn-outline" onClick={()=>{setAdminModal(false);setAdminPwd("");setAdminError("");}}>Cancelar</button>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    function Resultados({ matches, players, isAdmin, onUpdate }) {
+      const [showForm,setShowForm]=useState(false);
+      const [validationErrors,setValidationErrors]=useState([]);
+      const [confirmDialog,setConfirmDialog]=useState(null);
+      const [form,setForm]=useState({date:new Date().toISOString().split("T")[0],rival:"",selectedPlayers:Array(10).fill(""),teams:TEAM_POSITIONS.map(pos=>emptyTeam(pos))});
+      const pName=(id)=>players.find(p=>p.id===parseInt(id))?.name||"—";
+      const updateTeamField=(i,key,val)=>setForm(f=>{const teams=[...f.teams];teams[i]={...teams[i],[key]:val};return{...f,teams};});
+      const validate=()=>{
+        const errors=[];
+        const seen=new Map();
+        form.selectedPlayers.forEach((val,slot)=>{if(!val)return;const id=Number(val);const pair=Math.floor(slot/2)+1;if(!seen.has(id))seen.set(id,[]);seen.get(id).push(pair);});
+        seen.forEach((pairs,id)=>{if(pairs.length>1){const name=players.find(p=>p.id===id)?.name||`Jugador ${id}`;errors.push(`"${name}" duplicado en parejas ${pairs.join(" y ")}`);} });
+        return errors;
+      };
+      const resetForm=()=>{setForm({date:new Date().toISOString().split("T")[0],rival:"",selectedPlayers:Array(10).fill(""),teams:TEAM_POSITIONS.map(pos=>emptyTeam(pos))});setValidationErrors([]);};
+      const submit=()=>{
+        const errors=validate(); if(errors.length>0){setValidationErrors(errors);return;} setValidationErrors([]);
+        const teamsWithPlayers=form.teams.map((team,i)=>({position:team.position,players:[parseInt(form.selectedPlayers[i*2])||null,parseInt(form.selectedPlayers[i*2+1])||null],sides:team.sides,won:team.won,numSets:team.numSets}));
+        onUpdate([...matches,{id:Date.now(),date:form.date,rival:form.rival,teams:teamsWithPlayers}]);
+        setShowForm(false);resetForm();
+      };
+      const undoLast=()=>{const last=matches[matches.length-1];setConfirmDialog({message:`¿Deshacer el último partido?\n\nvs. ${last?.rival||"Rival"} · ${last?.date||""}`,onConfirm:()=>{onUpdate(matches.slice(0,-1));setConfirmDialog(null);}});};
+      const deleteMatch=(id)=>{const match=matches.find(m=>m.id===id);setConfirmDialog({message:`¿Eliminar partido vs. ${match?.rival||"Rival"} del ${match?.date||""}?`,onConfirm:()=>{onUpdate(matches.filter(m=>m.id!==id));setConfirmDialog(null);}});};
+      const totalWins=(match)=>match.teams.filter(t=>t.won).length;
+      return (
+        <div>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:24,flexWrap:"wrap",gap:10}}>
+            <div className="section-title" style={{marginBottom:0}}>PARTIDOS</div>
+            <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+              {isAdmin&&matches.length>0&&<button className="btn-undo" onClick={undoLast}>↩ Deshacer último</button>}
+              {isAdmin&&<button className="btn" onClick={()=>{setShowForm(!showForm);if(showForm)resetForm();}}>{showForm?"Cancelar":"+ Añadir partido"}</button>}
+            </div>
+          </div>
+          {showForm&&isAdmin&&(
+            <div className="card" style={{marginBottom:24,borderColor:"#e2ff5d33"}}>
+              <div style={{fontSize:13,color:"#e2ff5d",marginBottom:16,fontWeight:500}}>NUEVO PARTIDO</div>
+              {validationErrors.length>0&&<div className="error-banner">{validationErrors.map((e,i)=><div key={i}>⚠ {e}</div>)}</div>}
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:20}}>
+                <div><div style={{fontSize:11,color:"#4a5580",marginBottom:6}}>FECHA</div><input type="date" value={form.date} onChange={e=>setForm(f=>({...f,date:e.target.value}))} style={{width:"100%"}}/></div>
+                <div><div style={{fontSize:11,color:"#4a5580",marginBottom:6}}>EQUIPO RIVAL</div><input placeholder="Nombre del rival" value={form.rival} onChange={e=>setForm(f=>({...f,rival:e.target.value}))} style={{width:"100%"}}/></div>
+              </div>
+              <div style={{fontSize:11,color:"#4a5580",marginBottom:12,letterSpacing:1}}>PAREJAS, JUGADORES Y RESULTADOS</div>
+              {form.teams.map((team,i)=>(
+                <div key={i} style={{background:"#0d1526",borderRadius:10,padding:14,marginBottom:12,border:"1px solid #1e2d5066"}}>
+                  <div style={{fontSize:12,color:"#e2ff5d",fontWeight:500,marginBottom:12}}>PAREJA {team.position}</div>
+                  <div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:12}}>
+                    {[0,1].map(pi=>{
+                      const currentSide=team.sides?.[pi]||(pi===0?"izq":"der");
+                      return(
+                        <div key={pi} style={{display:"flex",gap:8,alignItems:"center"}}>
+                          <select value={form.selectedPlayers[i*2+pi]} onChange={e=>{const sp=[...form.selectedPlayers];sp[i*2+pi]=e.target.value;setForm(f=>({...f,selectedPlayers:sp}));}} style={{flex:1,fontSize:13}}>
+                            <option value="">— Jugador {pi+1} —</option>
+                            {players.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}
+                          </select>
+                          <div style={{display:"flex",borderRadius:6,overflow:"hidden",border:"1px solid #2a3560",flexShrink:0}}>
+                            {["izq","der"].map(side=>(
+                              <button key={side} onClick={()=>{const ns=[...(team.sides||["izq","der"])];ns[pi]=side;updateTeamField(i,"sides",ns);}} style={{padding:"6px 10px",fontSize:11,border:"none",cursor:"pointer",fontFamily:"inherit",background:currentSide===side?"#e2ff5d":"#1e2d50",color:currentSide===side?"#0a0f1e":"#6a7590",fontWeight:currentSide===side?"600":"400"}}>{side==="izq"?"◀ Izq":"Der ▶"}</button>
+                            ))}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <div style={{marginBottom:12}}>
+                    <div style={{fontSize:11,color:"#4a5580",marginBottom:8,display:"flex",alignItems:"center",gap:8}}>
+                      SETS JUGADOS:
+                      {[2,3].map(n=><button key={n} className="set-toggle" onClick={()=>updateTeamField(i,"numSets",n)} style={{background:team.numSets===n?"#e2ff5d":"#1e2d50",color:team.numSets===n?"#0a0f1e":"#6a7590"}}>{n} sets</button>)}
+                    </div>
+                  </div>
+                  <label style={{display:"flex",alignItems:"center",gap:10,cursor:"pointer",userSelect:"none"}}>
+                    <div onClick={()=>updateTeamField(i,"won",!team.won)} style={{width:36,height:20,borderRadius:10,position:"relative",transition:"background .2s",background:team.won?"#e2ff5d":"#2a3560",flexShrink:0}}>
+                      <div style={{position:"absolute",top:3,left:team.won?19:3,width:14,height:14,borderRadius:"50%",background:team.won?"#0a0f1e":"#6a7590",transition:"left .2s"}}/>
+                    </div>
+                    <span style={{fontSize:13,color:team.won?"#e2ff5d":"#6a7590"}}>{team.won?"✓ Victoria":"Derrota"}</span>
+                  </label>
+                </div>
+              ))}
+              <div style={{display:"flex",gap:10,marginTop:16}}>
+                <button className="btn" onClick={submit} style={{flex:1}}>Guardar partido</button>
+                <button className="btn-outline" onClick={()=>{setShowForm(false);resetForm();}}>Cancelar</button>
+              </div>
+            </div>
+          )}
+          {matches.length===0&&!showForm&&<div style={{color:"#4a5580",textAlign:"center",padding:48,fontSize:14}}>No hay partidos registrados aún.</div>}
+          {confirmDialog&&<ConfirmModal message={confirmDialog.message} onConfirm={confirmDialog.onConfirm} onCancel={()=>setConfirmDialog(null)}/>}
+          {[...matches].reverse().map(match=>{
+            const wins=totalWins(match);
+            return(
+              <div key={match.id} className="card" style={{marginBottom:14}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:14}}>
+                  <div><div style={{fontSize:16,fontWeight:500}}>vs. {match.rival||"Rival"}</div><div style={{fontSize:11,color:"#4a5580",marginTop:3}}>{match.date} · {wins}/5 victorias</div></div>
+                  <div style={{display:"flex",gap:8,alignItems:"center"}}>
+                    <span style={{fontFamily:"'Bebas Neue'",fontSize:30,color:wins>=3?"#e2ff5d":"#ff6b6b"}}>{wins}-{5-wins}</span>
+                    {isAdmin&&<button className="btn-danger" onClick={()=>deleteMatch(match.id)}>✕</button>}
+                  </div>
+                </div>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+                  {match.teams.map(team=>(
+                    <div key={team.position} style={{background:"#0d1526",borderRadius:8,padding:10,borderLeft:`3px solid ${team.won?"#e2ff5d":"#ff4d6d"}`}}>
+                      <div style={{fontSize:10,color:"#4a5580",marginBottom:5}}>PAREJA {team.position}</div>
+                      <div style={{fontSize:12}}>{pName(team.players[0])}{team.sides?.[0]&&<span style={{fontSize:10,color:"#4a5580",marginLeft:5}}>({team.sides[0]})</span>}</div>
+                      <div style={{fontSize:12,marginBottom:6}}>{pName(team.players[1])}{team.sides?.[1]&&<span style={{fontSize:10,color:"#4a5580",marginLeft:5}}>({team.sides[1]})</span>}</div>
+                      <div style={{fontSize:11,color:"#4a5580",marginBottom:4}}>{team.numSets||2} sets</div>
+                      <span className={`tag ${team.won?"tag-win":"tag-loss"}`}>{team.won?"Victoria":"Derrota"}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      );
+    }
+
+    const MONTH_NAMES=["Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic"];
+    function Puntos({ players, matches }) {
+      const [expanded,setExpanded]=useState(null);
+      const {windowStart,windowEnd}=getRollingWindow();
+      const now=new Date();
+      const months=[];
+      for(let i=11;i>=0;i--){const d=new Date(now.getFullYear(),now.getMonth()-1-i,1);months.push({year:d.getFullYear(),month:d.getMonth()});}
+      const ranked=[...players].map(p=>({...p,total:totalPoints(p,matches),rollingPts:(()=>{let pts=0;matches.forEach(m=>{const md=new Date(m.date);if(md>=windowStart&&md<=windowEnd)m.teams.forEach(t=>{if(t.players.includes(p.id)&&t.won)pts+=30;});});return pts;})()})).sort((a,b)=>b.total-a.total);
+      const fmtDate=(d)=>`${d.getDate()} ${MONTH_NAMES[d.getMonth()]} ${d.getFullYear()}`;
+      return(
+        <div>
+          <div className="section-title">CLASIFICACIÓN</div>
+          <div style={{fontSize:11,color:"#4a5580",marginBottom:16,background:"#111827",border:"1px solid #1e2d50",borderRadius:8,padding:"10px 14px",lineHeight:1.7}}>
+            <span style={{color:"#e2ff5d"}}>Ventana activa:</span> {fmtDate(windowStart)} → {fmtDate(windowEnd)}<br/>
+            <span>Base histórico + victorias últimos 12 meses · 30pts/victoria</span>
+          </div>
+          {ranked.map((p,i)=>(
+            <div key={p.id} style={{marginBottom:8}}>
+              <div className="card" style={{display:"flex",alignItems:"center",gap:14,flexWrap:"wrap",cursor:"pointer"}} onClick={()=>setExpanded(expanded===p.id?null:p.id)}>
+                <div style={{fontFamily:"'Bebas Neue'",fontSize:34,color:i===0?"#e2ff5d":i===1?"#a8d8ff":i===2?"#ffb347":"#2a3560",minWidth:38,textAlign:"center"}}>{i+1}</div>
+                <div style={{flex:1,minWidth:100}}>
+                  <div style={{fontSize:14,fontWeight:500}}>{p.name}</div>
+                  <div style={{fontSize:11,color:"#4a5580",marginTop:2}}>Base: {p.historicPoints} + Últimos 12M: {p.rollingPts} pts</div>
+                </div>
+                <div style={{textAlign:"right",display:"flex",alignItems:"center",gap:12}}>
+                  <div><div style={{fontFamily:"'Bebas Neue'",fontSize:26,color:"#e2ff5d"}}>{p.total}</div><div style={{fontSize:10,color:"#4a5580"}}>pts</div></div>
+                  <span style={{color:"#4a5580",fontSize:12}}>{expanded===p.id?"▲":"▼"}</span>
+                </div>
+              </div>
+              {expanded===p.id&&(
+                <div style={{background:"#0d1526",borderRadius:"0 0 10px 10px",padding:"12px 16px",border:"1px solid #1e2d50",borderTop:"none"}}>
+                  <div style={{fontSize:11,color:"#4a5580",marginBottom:10}}>DESGLOSE MENSUAL (últimos 12 meses)</div>
+                  <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:6}}>
+                    {months.map(({year,month})=>{const pts=pointsInMonth(p,matches,year,month);return(<div key={`${year}-${month}`} style={{background:"#111827",borderRadius:6,padding:"6px 8px",textAlign:"center",border:pts>0?"1px solid #e2ff5d44":"1px solid #1e2d50"}}><div style={{fontSize:10,color:"#4a5580"}}>{MONTH_NAMES[month]} {year}</div><div style={{fontFamily:"'Bebas Neue'",fontSize:18,color:pts>0?"#e2ff5d":"#2a3560"}}>{pts}</div></div>);})}
+                  </div>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      );
+    }
+
+    function Estadisticas({ players, matches, stats }) {
+      const [selected,setSelected]=useState(players[0]?.id);
+      const p=players.find(x=>x.id===selected);
+      const s=stats[selected];
+      const bp=s?bestPartner(selected,stats,players):null;
+      return(
+        <div>
+          <div className="section-title">ESTADÍSTICAS</div>
+          <div style={{marginBottom:20}}><select value={selected} onChange={e=>setSelected(parseInt(e.target.value))} style={{width:"100%",fontSize:15,padding:"10px 14px"}}>{players.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}</select></div>
+          {p&&s&&(<>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10,marginBottom:16}}>
+              {[{label:"Partidos",val:s.totalMatches},{label:"Victorias",val:s.totalWins},{label:"% Victorias",val:s.totalMatches?Math.round(s.totalWins/s.totalMatches*100)+"%":"—"}].map(stat=>(
+                <div key={stat.label} className="card" style={{textAlign:"center",padding:14}}><div style={{fontFamily:"'Bebas Neue'",fontSize:30,color:"#e2ff5d"}}>{stat.val}</div><div style={{fontSize:11,color:"#4a5580"}}>{stat.label}</div></div>
+              ))}
+            </div>
+            <div className="card" style={{marginBottom:14}}>
+              <div style={{fontSize:12,color:"#e2ff5d",marginBottom:14,fontWeight:500}}>RENDIMIENTO POR POSICIÓN</div>
+              {TEAM_POSITIONS.map(pos=>{const d=s.byPosition[pos];const pct=d.m?Math.round(d.w/d.m*100):null;return(<div key={pos} style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}><div style={{fontSize:11,color:"#4a5580",minWidth:64}}>PAREJA {pos}</div><div style={{flex:1,height:6,background:"#1e2d50",borderRadius:3,overflow:"hidden"}}><div style={{height:"100%",width:`${pct||0}%`,background:"#e2ff5d",borderRadius:3,transition:"width .5s"}}/></div><div style={{fontSize:12,minWidth:84,textAlign:"right",color:pct!==null?"#f0f4ff":"#4a5580"}}>{pct!==null?`${pct}% (${d.w}/${d.m})`:"Sin datos"}</div></div>);})}
+            </div>
+            <div className="card" style={{marginBottom:14}}>
+              <div style={{fontSize:12,color:"#e2ff5d",marginBottom:14,fontWeight:500}}>RENDIMIENTO POR LADO</div>
+              {["izq","der"].map(side=>{const d=s.bySide?.[side]||{w:0,m:0};const pct=d.m?Math.round(d.w/d.m*100):null;return(<div key={side} style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}><div style={{fontSize:11,color:"#4a5580",minWidth:84}}>{side==="izq"?"◀ IZQUIERDA":"DERECHA ▶"}</div><div style={{flex:1,height:6,background:"#1e2d50",borderRadius:3,overflow:"hidden"}}><div style={{height:"100%",width:`${pct||0}%`,background:"#a8d8ff",borderRadius:3,transition:"width .5s"}}/></div><div style={{fontSize:12,minWidth:84,textAlign:"right",color:pct!==null?"#f0f4ff":"#4a5580"}}>{pct!==null?`${pct}% (${d.w}/${d.m})`:"Sin datos"}</div></div>);})}
+            </div>
+            <div className="card">
+              <div style={{fontSize:12,color:"#e2ff5d",marginBottom:14,fontWeight:500}}>MEJOR PAREJA</div>
+              {bp?(<div style={{display:"flex",alignItems:"center",gap:14}}><div style={{width:44,height:44,borderRadius:"50%",background:"#e2ff5d22",border:"2px solid #e2ff5d44",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,flexShrink:0}}>🏆</div><div><div style={{fontSize:15,fontWeight:500}}>{bp.player?.name}</div><div style={{fontSize:12,color:"#4a5580",marginTop:2}}>{bp.wins}V / {bp.matches}P juntos · {Math.round(bp.ratio*100)}%</div></div></div>):<div style={{color:"#4a5580",fontSize:13}}>Sin datos de parejas aún.</div>}
+              {Object.entries(s.partners).length>0&&(<div style={{marginTop:16,borderTop:"1px solid #1e2d50",paddingTop:14}}><div style={{fontSize:11,color:"#4a5580",marginBottom:10}}>HISTORIAL CON TODOS</div>{Object.entries(s.partners).sort((a,b)=>(b[1].m?b[1].w/b[1].m:0)-(a[1].m?a[1].w/a[1].m:0)).map(([pid,d])=>{const partner=players.find(x=>x.id===parseInt(pid));const pct=d.m?Math.round(d.w/d.m*100):0;return(<div key={pid} style={{display:"flex",alignItems:"center",gap:10,marginBottom:8}}><div style={{fontSize:12,minWidth:110,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{partner?.name}</div><div style={{flex:1,height:4,background:"#1e2d50",borderRadius:2}}><div style={{height:"100%",width:`${pct}%`,background:"#e2ff5d88",borderRadius:2}}/></div><div style={{fontSize:11,color:"#4a5580",minWidth:80,textAlign:"right"}}>{d.w}/{d.m} · {pct}%</div></div>);})}</div>)}
+            </div>
+          </>)}
+        </div>
+      );
+    }
+
+    function Propuesta({ players, matches, stats }) {
+      const teams=proposeTeams(players,matches,stats);
+      const colors=["#e2ff5d","#a8d8ff","#ffb347","#c8a8ff","#7bffb8"];
+      return(
+        <div>
+          <div className="section-title">PROPUESTA PRÓXIMO PARTIDO</div>
+          <div style={{fontSize:12,color:"#4a5580",marginBottom:20}}>Ordenado por puntos totales. La pareja se elige según el mejor ratio de victorias compartidas.</div>
+          {teams.map((team,i)=>{
+            const [p1,p2]=team.players;
+            const pk=p1&&p2?stats[p1.id]?.partners[p2.id]:null;
+            const sr=pk&&pk.m>0?Math.round(pk.w/pk.m*100):null;
+            return(
+              <div key={i} className="card" style={{marginBottom:14,borderLeft:`4px solid ${colors[i]}`}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+                  <div><span style={{fontFamily:"'Bebas Neue'",fontSize:18,color:"#4a5580"}}>PAREJA </span><span style={{fontFamily:"'Bebas Neue'",fontSize:26,color:"#f0f4ff"}}>{team.position}</span></div>
+                  {sr!==null?<span style={{fontSize:11,color:"#e2ff5d",background:"#e2ff5d11",padding:"3px 10px",borderRadius:20,border:"1px solid #e2ff5d33"}}>{sr}% de victorias juntos</span>:<span style={{fontSize:11,color:"#4a5580"}}>Sin historial juntos</span>}
+                </div>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:12}}>
+                  {[p1,p2].map((p,pi)=>p&&(<div key={pi} style={{background:"#0d1526",borderRadius:8,padding:12}}><div style={{fontSize:14,fontWeight:500,marginBottom:4}}>{p.name}</div><div style={{fontFamily:"'Bebas Neue'",fontSize:22,color:colors[i]}}>{totalPoints(p,matches)}<span style={{fontSize:12,color:"#4a5580",fontFamily:"inherit",marginLeft:4}}>pts</span></div></div>))}
+                </div>
+                {p1&&p2&&(<div style={{background:"#0d1526",borderRadius:8,padding:"10px 14px",display:"flex",alignItems:"center",justifyContent:"space-between"}}><span style={{fontSize:12,color:"#4a5580"}}>TOTAL PAREJA</span><span style={{fontFamily:"'Bebas Neue'",fontSize:24,color:colors[i]}}>{totalPoints(p1,matches)+totalPoints(p2,matches)}<span style={{fontSize:13,color:"#4a5580",fontFamily:"inherit",marginLeft:4}}>pts</span></span></div>)}
+              </div>
+            );
+          })}
+          {players.length>teams.length*2&&(<div className="card" style={{borderColor:"#2a3560"}}><div style={{fontSize:11,color:"#4a5580",marginBottom:6}}>JUGADORES NO SELECCIONADOS</div><div style={{fontSize:13}}>{players.filter(p=>!teams.flatMap(t=>t.players).find(x=>x?.id===p.id)).map(p=>p.name).join(", ")}</div></div>)}
+        </div>
+      );
+    }
+
+    function AdminPanel({ players, onUpdatePlayers, matches, onUpdateMatches, currentPassword, onUpdatePassword }) {
+      const [newName,setNewName]=useState("");
+      const [editingName,setEditingName]=useState(null);
+      const [editNameVal,setEditNameVal]=useState("");
+      const [pwdForm,setPwdForm]=useState({current:"",next:"",confirm:""});
+      const [pwdError,setPwdError]=useState("");
+      const [pwdSuccess,setPwdSuccess]=useState(false);
+      const [editingPts,setEditingPts]=useState(null);
+      const [editPtsVal,setEditPtsVal]=useState("");
+      const [confirmDialog,setConfirmDialog]=useState(null);
+
+      const savePts=(pid)=>{const val=parseInt(editPtsVal);if(isNaN(val)||val<0)return;onUpdatePlayers(players.map(p=>p.id===pid?{...p,historicPoints:val}:p));setEditingPts(null);};
+      const addPlayer=()=>{if(!newName.trim())return;const id=Math.max(0,...players.map(p=>p.id))+1;onUpdatePlayers([...players,{id,name:newName.trim(),historicPoints:0}]);setNewName("");};
+      const saveName=(pid)=>{if(!editNameVal.trim())return;onUpdatePlayers(players.map(p=>p.id===pid?{...p,name:editNameVal.trim()}:p));setEditingName(null);};
+      const removePlayer=(pid)=>{const player=players.find(p=>p.id===pid);setConfirmDialog({message:`¿Eliminar a ${player?.name} del equipo?`,onConfirm:()=>{onUpdatePlayers(players.filter(p=>p.id!==pid));setConfirmDialog(null);}});};
+      const clearAll=()=>{setConfirmDialog({message:`¿Eliminar TODOS los partidos (${matches.length})? Esta acción no se puede deshacer.`,onConfirm:()=>{onUpdateMatches([]);setConfirmDialog(null);}});};
+      const changePassword=()=>{setPwdError("");setPwdSuccess(false);if(pwdForm.current!==currentPassword){setPwdError("La contraseña actual es incorrecta.");return;}if(pwdForm.next.length<4){setPwdError("La nueva contraseña debe tener al menos 4 caracteres.");return;}if(pwdForm.next!==pwdForm.confirm){setPwdError("Las contraseñas nuevas no coinciden.");return;}onUpdatePassword(pwdForm.next);setPwdForm({current:"",next:"",confirm:""});setPwdSuccess(true);};
+
+      return(
+        <div>
+          <div className="section-title">PANEL ADMIN</div>
+          {FB_CONFIGURED&&<div style={{fontSize:11,color:"#e2ff5d",background:"#e2ff5d11",border:"1px solid #e2ff5d33",borderRadius:8,padding:"8px 14px",marginBottom:16}}>✓ Firebase activo — datos en tiempo real compartidos con todo el equipo</div>}
+          {!FB_CONFIGURED&&<div className="card" style={{marginBottom:20,borderColor:"#ffb34744"}}><div style={{fontSize:12,color:"#ffb347",marginBottom:8,fontWeight:500}}>⚠ Firebase no configurado</div><div style={{fontSize:12,color:"#4a5580"}}>Los datos solo se guardan en este dispositivo.</div></div>}
+          <div className="card" style={{marginBottom:20,borderColor:"#e2ff5d22"}}>
+            <div style={{fontSize:12,color:"#e2ff5d",marginBottom:14,fontWeight:500}}>CAMBIAR CONTRASEÑA</div>
+            <div style={{display:"flex",flexDirection:"column",gap:8}}>
+              <input type="password" placeholder="Contraseña actual" value={pwdForm.current} onChange={e=>setPwdForm(f=>({...f,current:e.target.value}))}/>
+              <input type="password" placeholder="Nueva contraseña (mín. 4 caracteres)" value={pwdForm.next} onChange={e=>setPwdForm(f=>({...f,next:e.target.value}))}/>
+              <input type="password" placeholder="Confirmar nueva contraseña" value={pwdForm.confirm} onChange={e=>setPwdForm(f=>({...f,confirm:e.target.value}))} onKeyDown={e=>e.key==="Enter"&&changePassword()}/>
+            </div>
+            {pwdError&&<div style={{color:"#ff6b6b",fontSize:12,marginTop:8}}>⚠ {pwdError}</div>}
+            {pwdSuccess&&<div style={{color:"#e2ff5d",fontSize:12,marginTop:8}}>✓ Contraseña actualizada.</div>}
+            <button className="btn" onClick={changePassword} style={{marginTop:12}}>Cambiar contraseña</button>
+          </div>
+          <div className="card" style={{marginBottom:20}}>
+            <div style={{fontSize:12,color:"#e2ff5d",marginBottom:14,fontWeight:500}}>EQUIPO — {players.length} JUGADORES</div>
+            <div style={{maxHeight:420,overflowY:"auto",paddingRight:4}}>
+              {players.map((p,idx)=>(
+                <div key={p.id} style={{display:"flex",alignItems:"center",gap:8,marginBottom:6,paddingBottom:6,borderBottom:"1px solid #1e2d5044",flexWrap:"wrap"}}>
+                  <span style={{fontSize:11,color:"#4a5580",minWidth:26,textAlign:"right"}}>{idx+1}.</span>
+                  {editingName===p.id?(<><input value={editNameVal} onChange={e=>setEditNameVal(e.target.value)} onKeyDown={e=>e.key==="Enter"&&saveName(p.id)} style={{flex:1,minWidth:100,fontSize:13}} autoFocus/><button className="btn" onClick={()=>saveName(p.id)} style={{padding:"5px 10px",fontSize:12}}>✓</button><button className="btn-outline" onClick={()=>setEditingName(null)} style={{padding:"5px 10px",fontSize:12}}>✕</button></>):(
+                    <><span style={{flex:1,fontSize:13,minWidth:100}}>{p.name}</span>
+                    {editingPts===p.id?(<div style={{display:"flex",alignItems:"center",gap:4}}><input type="number" min="0" value={editPtsVal} onChange={e=>setEditPtsVal(e.target.value)} onKeyDown={e=>e.key==="Enter"&&savePts(p.id)} style={{width:72,fontSize:13,padding:"4px 8px"}} autoFocus/><button className="btn" onClick={()=>savePts(p.id)} style={{padding:"4px 8px",fontSize:12}}>✓</button><button className="btn-outline" onClick={()=>setEditingPts(null)} style={{padding:"4px 8px",fontSize:12}}>✕</button></div>):(<div style={{display:"flex",alignItems:"center",gap:6}}><span style={{fontSize:11,color:"#e2ff5d",background:"#e2ff5d11",padding:"3px 8px",borderRadius:12,border:"1px solid #e2ff5d22",minWidth:50,textAlign:"center"}}>{p.historicPoints} pts</span><button className="btn-outline" onClick={()=>{setEditingPts(p.id);setEditPtsVal(p.historicPoints);}} style={{fontSize:11,padding:"4px 8px"}}>✎ pts</button></div>)}
+                    <button className="btn-outline" onClick={()=>{setEditingName(p.id);setEditNameVal(p.name);}} style={{fontSize:11,padding:"4px 10px"}}>✎</button>
+                    <button className="btn-danger" onClick={()=>removePlayer(p.id)} style={{padding:"4px 10px"}}>✕</button></>
+                  )}
+                </div>
+              ))}
+            </div>
+            <div style={{display:"flex",gap:8,marginTop:14,borderTop:"1px solid #1e2d50",paddingTop:14}}>
+              <input placeholder="Nombre del nuevo jugador" value={newName} onChange={e=>setNewName(e.target.value)} onKeyDown={e=>e.key==="Enter"&&addPlayer()} style={{flex:1}}/>
+              <button className="btn" onClick={addPlayer}>+ Añadir</button>
+            </div>
+          </div>
+          <div className="card" style={{borderColor:"#ff4d6d44"}}>
+            <div style={{fontSize:12,color:"#ff6b6b",marginBottom:10,fontWeight:500}}>ZONA DE PELIGRO</div>
+            <div style={{fontSize:12,color:"#4a5580",marginBottom:14}}>{matches.length} partidos registrados en total.</div>
+            <button className="btn-danger" onClick={clearAll}>Eliminar todos los partidos</button>
+          </div>
+          {confirmDialog&&<ConfirmModal message={confirmDialog.message} onConfirm={confirmDialog.onConfirm} onCancel={()=>setConfirmDialog(null)}/>}
+        </div>
+      );
+    }
+
+    const root=ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<App/>);
+  </script>
+</body>
+</html>
